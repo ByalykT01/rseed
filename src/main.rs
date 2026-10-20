@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::env::{self};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 const REQUIRED_TOOLS: &[&str] = &[
     "fallocate",
@@ -36,58 +37,101 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Preflight => preflight(),
         Commands::Prepare { run_dir, size_mib } => prepare(&run_dir, size_mib),
-    }
-}
-
-fn prepare(run_dir: &std::path::Path, size_mib: u64) -> ExitCode {
-    let Some(size_bytes) = size_mib.checked_mul(1_048_576) else {
-        eprintln!("image size is too large!");
-        return ExitCode::FAILURE;
     };
 
-    match std::fs::create_dir(&run_dir) {
-        Ok(()) => {
-            println!("Created run directory: {}", run_dir.display());
-            println!("Planned image size: {} bytes", size_bytes);
-            ExitCode::SUCCESS
-        }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!(
-                "Couldnt create a run directory {}: {error}",
-                run_dir.display()
-            );
+            eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn preflight() -> ExitCode {
-    if !cfg!(target_os = "linux") {
-        eprintln!("preflight requires linux only.");
-        return ExitCode::FAILURE;
+fn allocate_image(size_bytes: u64, image_path: &Path) -> io::Result<()> {
+    let status = Command::new("fallocate")
+        .arg("-l")
+        .arg(size_bytes.to_string())
+        .arg("--")
+        .arg(image_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "fallocate failed for {}: {status}",
+            image_path.display()
+        )));
     }
 
-    let mut missing_count = 0;
+    Ok(())
+}
+
+fn format_ext4(image_path: &Path) -> io::Result<()> {
+    let status = Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("--")
+        .arg(image_path)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "mkfs.ext4 failed for {}: {status}",
+            image_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn prepare(run_dir: &Path, size_mib: u64) -> io::Result<()> {
+    let size_bytes = size_mib
+        .checked_mul(1_048_576)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "image size is too large!"))?;
+
+    std::fs::create_dir(run_dir)?;
+    println!("Created run directory: {}", run_dir.display());
+
+    let image_path = run_dir.join("disk.img");
+
+    allocate_image(size_bytes, image_path.as_path())?;
+    println!(
+        "Allocated disk image: {} ({size_bytes} bytes)",
+        image_path.display()
+    );
+    format_ext4(&image_path)?;
+    println!("Formatted disk image: {}", image_path.display());
+    Ok(())
+}
+
+fn preflight() -> io::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "preflight requires linux only.",
+        ));
+    }
+
+    let mut missing_count: u8 = 0;
     for tool in REQUIRED_TOOLS {
-        match find_tool(tool) {
-            Some(path) => {
-                println!("Found tool {}", path.display());
-            }
-            None => {
-                eprintln!("{} was not found", tool);
-                missing_count += 1;
-            }
+        if let Some(path) = find_tool(tool) {
+            println!("Found tool {}", path.display());
+        } else {
+            eprintln!("{tool} was not found");
+            missing_count = missing_count.saturating_add(1);
         }
     }
 
     if missing_count > 0 {
-        eprintln!("{missing_count} required tool(s) missing");
-        return ExitCode::FAILURE;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{missing_count} required tool(s) missing"),
+        ));
     }
-    ExitCode::SUCCESS
+
+    Ok(())
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {
