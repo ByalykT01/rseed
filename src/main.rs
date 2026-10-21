@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+const DEFAULT_RUN_DIR: &str = "rseed-run";
+
 const REQUIRED_TOOLS: &[&str] = &[
     "fallocate",
     "mkfs.ext4",
@@ -27,10 +29,19 @@ struct Cli {
 enum Commands {
     Preflight,
     Prepare {
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
         run_dir: PathBuf,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         size_mib: u64,
+    },
+
+    Mount {
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
+    },
+    Unmount {
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
     },
 }
 
@@ -40,6 +51,8 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Preflight => preflight(),
         Commands::Prepare { run_dir, size_mib } => prepare(&run_dir, size_mib),
+        Commands::Mount { run_dir } => mount_run(&run_dir),
+        Commands::Unmount { run_dir } => umount_run(&run_dir),
     };
 
     match result {
@@ -49,6 +62,91 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn umount_run(run_dir: &PathBuf) -> io::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rseed requires Linux",
+        ));
+    }
+
+    let run_dir = run_dir.canonicalize()?;
+    let mount_dir = run_dir.join("mnt");
+
+    umount_image(&mount_dir)?;
+    println!("Unmounted disk image at: {}", mount_dir.display());
+
+    std::fs::remove_dir(&mount_dir)?;
+
+    Ok(())
+}
+
+fn umount_image(mount_dir: &PathBuf) -> io::Result<()> {
+    let status = Command::new("umount").arg("--").arg(mount_dir).status()?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "umount failed for {}: {status}",
+            mount_dir.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn mount_run(run_dir: &PathBuf) -> io::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rseed requires Linux",
+        ));
+    }
+
+    let run_dir = run_dir.canonicalize()?;
+    let image_path = run_dir.join("disk.img");
+    let mount_dir = run_dir.join("mnt");
+
+    if !std::fs::metadata(&image_path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "disk.img must be created with prepare command",
+        ));
+    }
+
+    std::fs::create_dir(&mount_dir)?;
+
+    if let Err(error) = count_image(&image_path, &mount_dir) {
+        if let Err(cleanup_error) = std::fs::remove_dir(&mount_dir) {
+            eprintln!("couldn't remove {}: {cleanup_error}", mount_dir.display());
+        }
+        return Err(error);
+    }
+
+    println!("Mounted disk image at: {}", mount_dir.display());
+    Ok(())
+}
+
+fn count_image(image_path: &PathBuf, mount_dir: &PathBuf) -> io::Result<()> {
+    let status = Command::new("mount")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-o")
+        .arg("loop")
+        .arg("--")
+        .arg(image_path)
+        .arg(mount_dir)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "mount failed for {} at {}: {status}",
+            image_path.display(),
+            mount_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 fn allocate_image(size_bytes: u64, image_path: &Path) -> io::Result<()> {
@@ -103,6 +201,7 @@ fn prepare(run_dir: &Path, size_mib: u64) -> io::Result<()> {
     );
     format_ext4(&image_path)?;
     println!("Formatted disk image: {}", image_path.display());
+
     Ok(())
 }
 
