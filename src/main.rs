@@ -43,6 +43,10 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_RUN_DIR)]
         run_dir: PathBuf,
     },
+    Status {
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -53,6 +57,7 @@ fn main() -> ExitCode {
         Commands::Prepare { run_dir, size_mib } => prepare(&run_dir, size_mib),
         Commands::Mount { run_dir } => mount_run(&run_dir),
         Commands::Unmount { run_dir } => umount_run(&run_dir),
+        Commands::Status { run_dir } => status_run(&run_dir),
     };
 
     match result {
@@ -64,7 +69,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn umount_run(run_dir: &PathBuf) -> io::Result<()> {
+fn umount_run(run_dir: &Path) -> io::Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -96,7 +101,7 @@ fn umount_image(mount_dir: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
-fn mount_run(run_dir: &PathBuf) -> io::Result<()> {
+fn mount_run(run_dir: &Path) -> io::Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -117,7 +122,7 @@ fn mount_run(run_dir: &PathBuf) -> io::Result<()> {
 
     std::fs::create_dir(&mount_dir)?;
 
-    if let Err(error) = count_image(&image_path, &mount_dir) {
+    if let Err(error) = mount_image(&image_path, &mount_dir) {
         if let Err(cleanup_error) = std::fs::remove_dir(&mount_dir) {
             eprintln!("couldn't remove {}: {cleanup_error}", mount_dir.display());
         }
@@ -128,7 +133,7 @@ fn mount_run(run_dir: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
-fn count_image(image_path: &PathBuf, mount_dir: &PathBuf) -> io::Result<()> {
+fn mount_image(image_path: &PathBuf, mount_dir: &PathBuf) -> io::Result<()> {
     let status = Command::new("mount")
         .arg("-t")
         .arg("ext4")
@@ -230,6 +235,74 @@ fn preflight() -> io::Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+fn status_run(run_dir: &Path) -> io::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "preflight requires linux only.",
+        ));
+    }
+
+    let run_dir = run_dir.canonicalize()?;
+    let image_path = run_dir.join("disk.img");
+    let mount_dir = run_dir.join("mnt");
+
+    println!("Run directory: {}", run_dir.display());
+
+    let image_metadata = match std::fs::metadata(&image_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("Image: missing ({})", image_path.display());
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    if !image_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "disk.img must be a regular file",
+        ));
+    }
+
+    println!("Image: {}", image_path.display());
+    println!("Image size: {} bytes", image_metadata.len());
+
+    match std::fs::metadata(&mount_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mnt must be a directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("State: unmounted");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    let status = Command::new("findmnt")
+        .arg("--kernel")
+        .arg("--df")
+        .arg("--bytes")
+        .arg("--output")
+        .arg("SOURCE,FSTYPE,SIZE,USED,AVAIL,TARGET")
+        .arg("--mountpoint")
+        .arg(&mount_dir)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "could not confirm a mount at {}: {status}",
+            mount_dir.display()
+        )));
+    }
+
+    println!("State: mounted");
     Ok(())
 }
 
